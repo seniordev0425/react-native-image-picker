@@ -8,17 +8,20 @@ import android.content.ContentValues;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.database.Cursor;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
+import android.graphics.Matrix;
 import android.hardware.camera2.CameraCharacteristics;
+import android.media.MediaMetadataRetriever;
 import android.net.Uri;
 import android.os.Build;
 import android.os.ParcelFileDescriptor;
 import android.provider.MediaStore;
+import android.provider.OpenableColumns;
 import android.util.Base64;
 import android.webkit.MimeTypeMap;
 
-import androidx.annotation.Nullable;
 import androidx.core.app.ActivityCompat;
 import androidx.core.content.FileProvider;
 import androidx.exifinterface.media.ExifInterface;
@@ -201,19 +204,17 @@ public class Utils {
             Bitmap b = BitmapFactory.decodeStream(imageStream);
             b = Bitmap.createScaledBitmap(b, newDimens[0], newDimens[1], true);
             String originalOrientation = getOrientation(uri, context);
+            int orientation = originalOrientation != null ? Integer.parseInt(originalOrientation) :  ExifInterface.ORIENTATION_NORMAL;
+            b = getRotatedImage(b, orientation);
 
             File file = createFile(context, getFileTypeFromMime(mimeType));
             OutputStream os = context.getContentResolver().openOutputStream(Uri.fromFile(file));
             b.compress(getBitmapCompressFormat(mimeType), options.quality, os);
-            setOrientation(file, originalOrientation, context);
-
-            deleteFile(uri);
-
             return Uri.fromFile(file);
 
         } catch (Exception e) {
             e.printStackTrace();
-            return uri; // cannot resize the image, return the original uri
+            return  null;
         }
     }
 
@@ -222,14 +223,27 @@ public class Utils {
         return exifInterface.getAttribute(ExifInterface.TAG_ORIENTATION);
     }
 
-    // ExifInterface.saveAttributes is costly operation so don't set exif for unnecessary orientations
-    static void setOrientation(File file, String orientation, Context context) throws IOException {
-        if (orientation.equals(String.valueOf(ExifInterface.ORIENTATION_NORMAL)) || orientation.equals(String.valueOf(ExifInterface.ORIENTATION_UNDEFINED))) {
-            return;
+    static Bitmap getRotatedImage(Bitmap bitmap, int orientation) throws IOException {
+        if (orientation == ExifInterface.ORIENTATION_NORMAL) {
+            return bitmap;
         }
-        ExifInterface exifInterface = new ExifInterface(file);
-        exifInterface.setAttribute(ExifInterface.TAG_ORIENTATION, orientation);
-        exifInterface.saveAttributes();
+
+        int rotationAngle;
+        switch (orientation) {
+            case ExifInterface.ORIENTATION_ROTATE_90: rotationAngle = 90; break;
+            case ExifInterface.ORIENTATION_ROTATE_180: rotationAngle = 180; break;
+            case ExifInterface.ORIENTATION_ROTATE_270: rotationAngle = 270; break;
+            default: rotationAngle = 0;
+        }
+
+        if (rotationAngle == 0) return bitmap;
+
+        int width = bitmap.getWidth();
+        int height = bitmap.getHeight();
+
+        Matrix matrix = new Matrix();
+        matrix.setRotate(rotationAngle, (float) width / 2, (float) height / 2);
+        return Bitmap.createBitmap(bitmap, 0, 0, width, height, matrix, true);
     }
 
     static int[] getImageDimensBasedOnConstraints(int origWidth, int origHeight, Options options) {
@@ -263,6 +277,14 @@ public class Utils {
         }
     }
 
+    static int getDuration(Uri uri, Context context) {
+        MediaMetadataRetriever m = new MediaMetadataRetriever();
+        m.setDataSource(context, uri);
+        int duration = Math.round(Float.parseFloat(m.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION))) / 1000;
+        m.release();
+        return duration;
+    }
+
     static boolean shouldResizeImage(int origWidth, int origHeight, Options options) {
         if ((options.maxWidth == 0 || options.maxHeight == 0) && options.quality == 100) {
             return false;
@@ -290,7 +312,6 @@ public class Utils {
         switch (mimeType) {
             case "image/jpeg": return "jpg";
             case "image/png": return "png";
-            case "image/gif": return "gif";
         }
         return "jpg";
     }
@@ -339,43 +360,29 @@ public class Utils {
     }
 
     static boolean isImageType(Uri uri, Context context) {
-      return Utils.isContentType("image/", uri, context);
+        String imageMimeType = "image/";
+
+        if (uri.getScheme().equals("file")) {
+            return getMimeTypeFromFileUri(uri).contains(imageMimeType);
+        }
+
+        ContentResolver contentResolver = context.getContentResolver();
+        return contentResolver.getType(uri).contains(imageMimeType);
     }
 
     static boolean isVideoType(Uri uri, Context context) {
-        return Utils.isContentType("video/", uri, context);
-    }
+        String videoMimeType = "video/";
 
-  /**
-   * Verifies the content typs of a file URI. A helper function
-   * for isVideoType and isImageType
-   *
-   * @param contentMimeType - "video/" or "image/"
-   * @param uri - file uri
-   * @param context - react context
-   * @return a boolean to determine if file is of specified content type i.e. image or video
-   */
-    static boolean isContentType(String contentMimeType, Uri uri, Context context) {
-      final String mimeType = getMimeType(uri, context);
-
-      if(mimeType != null) {
-        return mimeType.contains(contentMimeType);
-      }
-
-      return false;
-    }
-
-    static @Nullable String getMimeType(Uri uri, Context context) {
-      if (uri.getScheme().equals("file")) {
-        return getMimeTypeFromFileUri(uri);
-      }
-
-      ContentResolver contentResolver = context.getContentResolver();
-      return contentResolver.getType(uri);
+        if (uri.getScheme().equals("file")) {
+            return getMimeTypeFromFileUri(uri).contains(videoMimeType);
+        }
+        
+        ContentResolver contentResolver = context.getContentResolver();
+        return contentResolver.getType(uri).contains("video/");
     }
 
     static List<Uri> collectUrisFromData(Intent data) {
-        // Default Gallery app on older Android versions doesn't support multiple image
+        // Default Gallery app on older Android versions doesnt support multiple image
         // picking and thus never uses clip data.
         if (data.getClipData() == null) {
             return Collections.singletonList(data.getData());
@@ -393,7 +400,6 @@ public class Utils {
 
     static ReadableMap getImageResponseMap(Uri uri, Options options, Context context) {
         String fileName = uri.getLastPathSegment();
-        ImageMetadata imageMetadata = new ImageMetadata(uri, context);
         int[] dimensions = getImageDimensions(uri, context);
 
         WritableMap map = Arguments.createMap();
@@ -403,41 +409,20 @@ public class Utils {
         map.putString("type", getMimeTypeFromFileUri(uri));
         map.putInt("width", dimensions[0]);
         map.putInt("height", dimensions[1]);
-        map.putString("type", getMimeType(uri, context));
 
         if (options.includeBase64) {
             map.putString("base64", getBase64String(uri, context));
         }
-
-        if(options.includeExtra) {
-          // Add more extra data here ...
-          map.putString("timestamp", imageMetadata.getDateTime());
-          map.putString("id", fileName);
-        }
-
         return map;
     }
 
-    static ReadableMap getVideoResponseMap(Uri uri, Options options, Context context) {
+    static ReadableMap getVideoResponseMap(Uri uri, Context context) {
         String fileName = uri.getLastPathSegment();
         WritableMap map = Arguments.createMap();
-        VideoMetadata videoMetadata = new VideoMetadata(uri, context);
-
         map.putString("uri", uri.toString());
         map.putDouble("fileSize", getFileSize(uri, context));
-        map.putInt("duration", videoMetadata.getDuration());
-        map.putInt("bitrate", videoMetadata.getBitrate());
+        map.putInt("duration", getDuration(uri, context));
         map.putString("fileName", fileName);
-        map.putString("type", getMimeType(uri, context));
-        map.putInt("width", videoMetadata.getWidth());
-        map.putInt("height", videoMetadata.getHeight());
-
-        if(options.includeExtra) {
-          // Add more extra data here ...
-          map.putString("timestamp", videoMetadata.getDateTime());
-          map.putString("id", fileName);
-        }
-
         return map;
     }
 
@@ -448,13 +433,11 @@ public class Utils {
             Uri uri = fileUris.get(i);
 
             if (isImageType(uri, context)) {
-                if (uri.getScheme().contains("content")) {
-                    uri = getAppSpecificStorageUri(uri, context);
-                }
-                uri = resizeImage(uri, context, options);
-                assets.pushMap(getImageResponseMap(uri, options, context));
+                Uri localUri = getAppSpecificStorageUri(uri, context);
+                localUri = resizeImage(localUri, context, options);
+                assets.pushMap(getImageResponseMap(localUri, options, context));
             } else if (isVideoType(uri, context)) {
-                assets.pushMap(getVideoResponseMap(uri, options, context));
+                assets.pushMap(getVideoResponseMap(uri, context));
             } else {
                 throw new RuntimeException("Unsupported file type");
             }
